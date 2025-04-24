@@ -1,0 +1,103 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        ECR_REPO = '891612581930.dkr.ecr.us-east-1.amazonaws.com/capstoneapp2'
+    }
+
+    triggers {
+        pollSCM('')
+    }
+
+    stages {
+        stage('Checkout App Code') {
+            steps {
+                git credentialsId: 'github-creds-id',
+                    branch: 'main',
+                    url: 'https://github.com/EbisonJ/webcapstoneapp2.git'
+            }
+        }
+
+        stage('Get Commit Hash') {
+            steps {
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage('Login to ECR') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+                        aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+                        aws configure set region $AWS_REGION
+                        aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_REPO
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh "sudo docker build -t $ECR_REPO:$GIT_COMMIT_SHORT ."
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh "sudo docker push $ECR_REPO:$GIT_COMMIT_SHORT"
+            }
+        }
+
+        stage('Update Helm Chart') {
+            steps {
+                dir('helm-chart') {
+                    // Clone Helm chart repo
+                    git branch: 'main', 
+                       credentialsId: 'git-pat-all', 
+                       url: 'https://github.com/EbisonJ/capstoneguestbook.git'
+
+                    // Update values.yaml
+                    sh """
+                        sed -i "s|image:.*/capstoneapp2:.*|image: ${ECR_REPO}:${GIT_COMMIT_SHORT}|" capstoneapphelm/values.yaml
+                    """
+
+                    // Configure Git identity
+                    sh """
+                        git config user.email 'jenkins@example.com'
+                        git config user.name 'Jenkins CI'
+                    """
+
+                    // Commit changes
+                    sh """
+                        git add capstoneapphelm/values.yaml
+                        git commit -m '[Jenkins] Update webapp1 image to ${GIT_COMMIT_SHORT}' || echo 'No changes to commit'
+                    """
+
+                    // Push changes with credentials
+                    withCredentials([usernamePassword(
+                        credentialsId: 'git-pat-all',
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_PASSWORD'
+                    )]) {
+                        sh """
+                            git remote set-url origin https://${GIT_USER}:${GIT_PASSWORD}@github.com/EbisonJ/capstoneguestbook.git
+                            git push origin main
+                        """
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            deleteDir() // Clean workspace after build
+        }
+    }
+}
